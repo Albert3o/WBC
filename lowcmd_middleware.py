@@ -133,13 +133,18 @@ class LowCmdMiddleware:
             f"[Middleware] Starting lowcmd mixer at {self.publish_rate_hz:.1f} Hz "
             f"(WBC timeout={self.wbc_timeout_s}s, teleop timeout={self.teleop_timeout_s}s)"
         )
-        while True:
-            start = time.time()
-            self._poll_inputs(start)
-            self._merge_frame(start)
-            self.output_pub.Write(self.merged_cmd)
-            elapsed = time.time() - start
-            time.sleep(max(0.0, dt - elapsed))
+        print("[Middleware] Press Ctrl+C to stop.")
+        try:
+            while True:
+                start = time.time()
+                self._poll_inputs(start)
+                self._merge_frame(start)
+                self.output_pub.Write(self.merged_cmd)
+                elapsed = time.time() - start
+                time.sleep(max(0.0, dt - elapsed))
+        except KeyboardInterrupt:
+            print("\n[Middleware] KeyboardInterrupt received. Shutting down mixer loop.")
+            return
 
 
 def parse_args():
@@ -157,13 +162,19 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    ChannelFactoryInitialize(args.domain_id, networkInterface=args.network_interface)
-    mixer = LowCmdMiddleware(
-        publish_rate_hz=args.publish_rate,
-        wbc_timeout_s=args.wbc_timeout,
-        teleop_timeout_s=args.teleop_timeout,
-        legs_topic=args.legs_topic,
-        arms_topic=args.arms_topic,
-        output_topic=args.output_topic,
-    )
-    mixer.run()
+    try:
+        ChannelFactoryInitialize(args.domain_id, networkInterface=args.network_interface)
+        mixer = LowCmdMiddleware(
+            publish_rate_hz=args.publish_rate,
+            wbc_timeout_s=args.wbc_timeout,
+            teleop_timeout_s=args.teleop_timeout,
+            legs_topic=args.legs_topic,
+            arms_topic=args.arms_topic,
+            output_topic=args.output_topic,
+        )
+        mixer.run()
+    except KeyboardInterrupt:
+        print("[Middleware] Exited cleanly after interrupt.")
+    except Exception as exc:
+        print(f"[Middleware] Fatal error: {exc}")
+        raise
