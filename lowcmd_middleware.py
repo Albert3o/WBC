@@ -21,9 +21,7 @@ _shutdown_requested = False
 def _request_shutdown(signum: int, _frame) -> None:
     global _shutdown_requested
     _shutdown_requested = True
-    # Second Ctrl+C: restore default and re-raise so the user can force-quit.
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    print(f"\n[Middleware] Stop requested (signal {signum}). Finishing after current step...", flush=True)
+    print(f"\n[Middleware] Stop requested (signal {signum}). Exiting loop...", flush=True)
 
 
 def _sleep_interruptible(total_s: float, chunk_s: float = 0.02) -> None:
@@ -57,11 +55,13 @@ class LowCmdMiddleware:
         arms_topic: str,
         output_topic: str,
         no_write: bool = False,
+        dds_read_timeout_s: float = 0.005,
     ):
         self.publish_rate_hz = publish_rate_hz
         self.wbc_timeout_s = wbc_timeout_s
         self.teleop_timeout_s = teleop_timeout_s
         self.no_write = no_write
+        self.dds_read_timeout_s = dds_read_timeout_s
 
         self.legs_sub = ChannelSubscriber(legs_topic, hg_LowCmd)
         self.legs_sub.Init()
@@ -97,17 +97,20 @@ class LowCmdMiddleware:
             cmd.motor_cmd[idx].reserve = 0
 
     def _poll_inputs(self, now: float) -> None:
-        legs_msg = self.legs_sub.Read()
+        # Never call Read() without a timeout: take_one() can block in native code and
+        # defer SIGINT until it returns, which makes Ctrl+C appear "stuck".
+        t = self.dds_read_timeout_s
+        legs_msg = self.legs_sub.Read(t)
         if legs_msg is not None:
             self.latest_legs_cmd = legs_msg
             self.last_legs_ts = now
 
-        arms_msg = self.arms_sub.Read()
+        arms_msg = self.arms_sub.Read(t)
         if arms_msg is not None:
             self.latest_arms_cmd = arms_msg
             self.last_arms_ts = now
 
-        lowstate_msg = self.lowstate_sub.Read()
+        lowstate_msg = self.lowstate_sub.Read(t)
         if lowstate_msg is not None:
             self.latest_lowstate = lowstate_msg
 
@@ -165,7 +168,7 @@ class LowCmdMiddleware:
                 "[Middleware] --no-write: DDS Write disabled (use for bring-up / Ctrl+C testing).",
                 flush=True,
             )
-        print("[Middleware] Press Ctrl+C once to stop (may wait until after DDS Write returns).", flush=True)
+        print("[Middleware] Press Ctrl+C to stop (long DDS Write may still delay exit briefly).", flush=True)
 
         if hasattr(signal, "SIGINT"):
             signal.signal(signal.SIGINT, _request_shutdown)
@@ -211,11 +214,21 @@ def parse_args():
         action="store_true",
         help="Do not call DDS Write (merge + CRC still runs). Use to verify Ctrl+C and isolate blocking in Write.",
     )
+    parser.add_argument(
+        "--dds-read-timeout",
+        type=float,
+        default=0.005,
+        metavar="SEC",
+        help="Per-topic DDS read wait (seconds). Must be >0 so Read() does not block uninterruptibly (default 0.005).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.dds_read_timeout <= 0:
+        print("[Middleware] --dds-read-timeout must be > 0 (use a small value like 0.005).", flush=True)
+        sys.exit(2)
     try:
         ChannelFactoryInitialize(args.domain_id, networkInterface=args.network_interface)
         mixer = LowCmdMiddleware(
@@ -226,6 +239,7 @@ if __name__ == "__main__":
             arms_topic=args.arms_topic,
             output_topic=args.output_topic,
             no_write=args.no_write,
+            dds_read_timeout_s=args.dds_read_timeout,
         )
         mixer.run()
     except KeyboardInterrupt:
