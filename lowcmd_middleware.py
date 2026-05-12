@@ -34,6 +34,21 @@ def _sleep_interruptible(total_s: float, chunk_s: float = 0.02) -> None:
         time.sleep(min(chunk_s, max(0.0, remaining)))
 
 
+def format_lowcmd_for_terminal(cmd) -> str:
+    """Human-readable dump of one HG LowCmd (same layout as merged output on rt/lowcmd)."""
+    lines = [
+        f"mode_pr={cmd.mode_pr} mode_machine={cmd.mode_machine} crc={cmd.crc}",
+        "motor_cmd[]:",
+    ]
+    for i in range(TOTAL_MOTORS):
+        m = cmd.motor_cmd[i]
+        lines.append(
+            f"  [{i:2d}] mode=0x{m.mode:02x} q={m.q:.6f} dq={m.dq:.6f} tau={m.tau:.6f} "
+            f"kp={m.kp:.6f} kd={m.kd:.6f} reserve={m.reserve}"
+        )
+    return "\n".join(lines)
+
+
 def copy_motor_cmd(dst_cmd, src_cmd) -> None:
     """Copy all low-level motor command fields."""
     dst_cmd.mode = src_cmd.mode
@@ -56,12 +71,27 @@ class LowCmdMiddleware:
         output_topic: str,
         no_write: bool = False,
         dds_read_timeout_s: float = 0.005,
+        no_publish: bool = False,
+        print_merged: bool = False,
+        print_merged_every: int = 1,
+        print_input_rx: bool = False,
     ):
         self.publish_rate_hz = publish_rate_hz
         self.wbc_timeout_s = wbc_timeout_s
         self.teleop_timeout_s = teleop_timeout_s
-        self.no_write = no_write
+        self.no_write = no_write or no_publish
         self.dds_read_timeout_s = dds_read_timeout_s
+        self.no_publish = no_publish
+        self.print_merged = print_merged
+        self.print_merged_every = print_merged_every
+        self.print_input_rx = print_input_rx
+        self._legs_topic = legs_topic
+        self._arms_topic = arms_topic
+        self._output_topic = output_topic
+        self._rx_legs = 0
+        self._rx_arms = 0
+        self._last_legs_rx_log_t = -1e9
+        self._last_arms_rx_log_t = -1e9
 
         self.legs_sub = ChannelSubscriber(legs_topic, hg_LowCmd)
         self.legs_sub.Init()
@@ -69,8 +99,11 @@ class LowCmdMiddleware:
         self.arms_sub.Init()
         self.lowstate_sub = ChannelSubscriber("rt/lowstate", hg_LowState)
         self.lowstate_sub.Init()
-        self.output_pub = ChannelPublisher(output_topic, hg_LowCmd)
-        self.output_pub.Init()
+        if no_publish:
+            self.output_pub = None
+        else:
+            self.output_pub = ChannelPublisher(output_topic, hg_LowCmd)
+            self.output_pub.Init()
 
         self.crc = CRC()
         self.merged_cmd = unitree_hg_msg_dds__LowCmd_()
@@ -113,6 +146,24 @@ class LowCmdMiddleware:
         lowstate_msg = self.lowstate_sub.Read(t)
         if lowstate_msg is not None:
             self.latest_lowstate = lowstate_msg
+
+        if self.print_input_rx:
+            if legs_msg is not None:
+                self._rx_legs += 1
+                if now - self._last_legs_rx_log_t >= 0.25:
+                    self._last_legs_rx_log_t = now
+                    print(
+                        f"[Middleware] RX {self._legs_topic} (frames_total={self._rx_legs})",
+                        flush=True,
+                    )
+            if arms_msg is not None:
+                self._rx_arms += 1
+                if now - self._last_arms_rx_log_t >= 0.25:
+                    self._last_arms_rx_log_t = now
+                    print(
+                        f"[Middleware] RX {self._arms_topic} (frames_total={self._rx_arms})",
+                        flush=True,
+                    )
 
     def _apply_emergency_lower_body(self) -> None:
         """
@@ -163,9 +214,20 @@ class LowCmdMiddleware:
             f"(WBC timeout={self.wbc_timeout_s}s, teleop timeout={self.teleop_timeout_s}s)",
             flush=True,
         )
-        if self.no_write:
+        if self.no_publish:
             print(
-                "[Middleware] --no-write: DDS Write disabled (use for bring-up / Ctrl+C testing).",
+                f"[Middleware] --no-publish: no DDS publisher on {self._output_topic!r} (robot will not see this process).",
+                flush=True,
+            )
+        elif self.no_write:
+            print(
+                "[Middleware] --no-write: DDS Write disabled (publisher exists; use for bring-up / Ctrl+C testing).",
+                flush=True,
+            )
+        if self.print_merged:
+            print(
+                f"[Middleware] --print-merged every {self.print_merged_every} iteration(s); "
+                "use --print-merged-every 25 to reduce rate at 50 Hz.",
                 flush=True,
             )
         print("[Middleware] Press Ctrl+C to stop (long DDS Write may still delay exit briefly).", flush=True)
@@ -183,12 +245,19 @@ class LowCmdMiddleware:
                 start = time.time()
                 self._poll_inputs(start)
                 self._merge_frame(start)
-                if iteration == 0:
-                    print("[Middleware] First merged frame ready; calling DDS Write...", flush=True)
-                if not self.no_write:
+                if self.print_merged and self.print_merged_every > 0 and (iteration % self.print_merged_every == 0):
+                    print(
+                        f"======== merged LowCmd -> {self._output_topic!r} "
+                        f"iteration={iteration} t={time.time():.3f} ========",
+                        flush=True,
+                    )
+                    print(format_lowcmd_for_terminal(self.merged_cmd), flush=True)
+                if self.output_pub is not None and not self.no_write:
+                    if iteration == 0:
+                        print("[Middleware] First merged frame ready; calling DDS Write...", flush=True)
                     self.output_pub.Write(self.merged_cmd)
-                if iteration == 0:
-                    print("[Middleware] DDS Write returned.", flush=True)
+                    if iteration == 0:
+                        print("[Middleware] DDS Write returned.", flush=True)
                 iteration += 1
                 elapsed = time.time() - start
                 _sleep_interruptible(max(0.0, dt - elapsed))
@@ -212,7 +281,29 @@ def parse_args():
     parser.add_argument(
         "--no-write",
         action="store_true",
-        help="Do not call DDS Write (merge + CRC still runs). Use to verify Ctrl+C and isolate blocking in Write.",
+        help="Do not call DDS Write (merge + CRC still runs). Publisher on --output-topic still exists unless --no-publish.",
+    )
+    parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Do not create a DDS publisher on --output-topic (no rt/lowcmd from this process; safe bench on real robot).",
+    )
+    parser.add_argument(
+        "--print-merged",
+        action="store_true",
+        help="Print merged LowCmd to stdout (see --print-merged-every).",
+    )
+    parser.add_argument(
+        "--print-merged-every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="With --print-merged, print every N loop iterations (default 1 = every loop).",
+    )
+    parser.add_argument(
+        "--print-input-rx",
+        action="store_true",
+        help="Log when legs/arms LowCmd samples arrive (throttled ~4 Hz per stream).",
     )
     parser.add_argument(
         "--dds-read-timeout",
@@ -229,6 +320,9 @@ if __name__ == "__main__":
     if args.dds_read_timeout <= 0:
         print("[Middleware] --dds-read-timeout must be > 0 (use a small value like 0.005).", flush=True)
         sys.exit(2)
+    if args.print_merged and args.print_merged_every < 1:
+        print("[Middleware] --print-merged-every must be >= 1.", flush=True)
+        sys.exit(2)
     try:
         ChannelFactoryInitialize(args.domain_id, networkInterface=args.network_interface)
         mixer = LowCmdMiddleware(
@@ -240,6 +334,10 @@ if __name__ == "__main__":
             output_topic=args.output_topic,
             no_write=args.no_write,
             dds_read_timeout_s=args.dds_read_timeout,
+            no_publish=args.no_publish,
+            print_merged=args.print_merged,
+            print_merged_every=args.print_merged_every,
+            print_input_rx=args.print_input_rx,
         )
         mixer.run()
     except KeyboardInterrupt:
