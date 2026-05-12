@@ -1,4 +1,6 @@
 import argparse
+import signal
+import sys
 import time
 from typing import Optional
 
@@ -11,6 +13,27 @@ from unitree_sdk2py.utils.crc import CRC
 TOTAL_MOTORS = 35
 LOWER_BODY_INDICES = list(range(0, 15))  # Legs + waist
 ARM_INDICES = list(range(15, 29))  # Left/right arms
+
+# Set by SIGINT/SIGTERM so we can exit quickly between loop iterations (does not unblock a stuck C call).
+_shutdown_requested = False
+
+
+def _request_shutdown(signum: int, _frame) -> None:
+    global _shutdown_requested
+    _shutdown_requested = True
+    # Second Ctrl+C: restore default and re-raise so the user can force-quit.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    print(f"\n[Middleware] Stop requested (signal {signum}). Finishing after current step...", flush=True)
+
+
+def _sleep_interruptible(total_s: float, chunk_s: float = 0.02) -> None:
+    """Sleep in small slices so Python can process pending signals between chunks."""
+    end = time.monotonic() + total_s
+    while time.monotonic() < end:
+        if _shutdown_requested:
+            raise KeyboardInterrupt()
+        remaining = end - time.monotonic()
+        time.sleep(min(chunk_s, max(0.0, remaining)))
 
 
 def copy_motor_cmd(dst_cmd, src_cmd) -> None:
@@ -33,10 +56,12 @@ class LowCmdMiddleware:
         legs_topic: str,
         arms_topic: str,
         output_topic: str,
+        no_write: bool = False,
     ):
         self.publish_rate_hz = publish_rate_hz
         self.wbc_timeout_s = wbc_timeout_s
         self.teleop_timeout_s = teleop_timeout_s
+        self.no_write = no_write
 
         self.legs_sub = ChannelSubscriber(legs_topic, hg_LowCmd)
         self.legs_sub.Init()
@@ -128,23 +153,47 @@ class LowCmdMiddleware:
         self.merged_cmd.crc = self.crc.Crc(self.merged_cmd)
 
     def run(self) -> None:
+        global _shutdown_requested
         dt = 1.0 / self.publish_rate_hz
         print(
             f"[Middleware] Starting lowcmd mixer at {self.publish_rate_hz:.1f} Hz "
-            f"(WBC timeout={self.wbc_timeout_s}s, teleop timeout={self.teleop_timeout_s}s)"
+            f"(WBC timeout={self.wbc_timeout_s}s, teleop timeout={self.teleop_timeout_s}s)",
+            flush=True,
         )
-        print("[Middleware] Press Ctrl+C to stop.")
+        if self.no_write:
+            print(
+                "[Middleware] --no-write: DDS Write disabled (use for bring-up / Ctrl+C testing).",
+                flush=True,
+            )
+        print("[Middleware] Press Ctrl+C once to stop (may wait until after DDS Write returns).", flush=True)
+
+        if hasattr(signal, "SIGINT"):
+            signal.signal(signal.SIGINT, _request_shutdown)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _request_shutdown)
+
         try:
+            iteration = 0
             while True:
+                if _shutdown_requested:
+                    raise KeyboardInterrupt()
                 start = time.time()
                 self._poll_inputs(start)
                 self._merge_frame(start)
-                self.output_pub.Write(self.merged_cmd)
+                if iteration == 0:
+                    print("[Middleware] First merged frame ready; calling DDS Write...", flush=True)
+                if not self.no_write:
+                    self.output_pub.Write(self.merged_cmd)
+                if iteration == 0:
+                    print("[Middleware] DDS Write returned.", flush=True)
+                iteration += 1
                 elapsed = time.time() - start
-                time.sleep(max(0.0, dt - elapsed))
+                _sleep_interruptible(max(0.0, dt - elapsed))
         except KeyboardInterrupt:
-            print("\n[Middleware] KeyboardInterrupt received. Shutting down mixer loop.")
+            print("\n[Middleware] Shutting down mixer loop.", flush=True)
             return
+        finally:
+            _shutdown_requested = False
 
 
 def parse_args():
@@ -157,6 +206,11 @@ def parse_args():
     parser.add_argument("--legs-topic", type=str, default="rt/lowcmd_legs", help="Input topic for WBC lowcmd.")
     parser.add_argument("--arms-topic", type=str, default="rt/lowcmd_arms", help="Input topic for XR lowcmd.")
     parser.add_argument("--output-topic", type=str, default="rt/lowcmd", help="Output merged lowcmd topic.")
+    parser.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Do not call DDS Write (merge + CRC still runs). Use to verify Ctrl+C and isolate blocking in Write.",
+    )
     return parser.parse_args()
 
 
@@ -171,10 +225,12 @@ if __name__ == "__main__":
             legs_topic=args.legs_topic,
             arms_topic=args.arms_topic,
             output_topic=args.output_topic,
+            no_write=args.no_write,
         )
         mixer.run()
     except KeyboardInterrupt:
-        print("[Middleware] Exited cleanly after interrupt.")
+        print("[Middleware] Exited cleanly after interrupt.", flush=True)
+        sys.exit(0)
     except Exception as exc:
-        print(f"[Middleware] Fatal error: {exc}")
+        print(f"[Middleware] Fatal error: {exc}", flush=True)
         raise
