@@ -75,6 +75,7 @@ class LowCmdMiddleware:
         print_merged: bool = False,
         print_merged_every: int = 1,
         print_input_rx: bool = False,
+        wait_for_legs_before_write: bool = False,
     ):
         self.publish_rate_hz = publish_rate_hz
         self.wbc_timeout_s = wbc_timeout_s
@@ -82,6 +83,7 @@ class LowCmdMiddleware:
         self.no_write = no_write or no_publish
         self.dds_read_timeout_s = dds_read_timeout_s
         self.no_publish = no_publish
+        self.wait_for_legs_before_write = wait_for_legs_before_write
         self.print_merged = print_merged
         self.print_merged_every = print_merged_every
         self.print_input_rx = print_input_rx
@@ -224,6 +226,20 @@ class LowCmdMiddleware:
                 "[Middleware] --no-write: DDS Write disabled (publisher exists; use for bring-up / Ctrl+C testing).",
                 flush=True,
             )
+        if (
+            self.output_pub is not None
+            and not self.no_write
+            and not self.no_publish
+        ):
+            print(
+                f"[Middleware] LIVE: DDS Write enabled -> topic {self._output_topic!r} @ {self.publish_rate_hz:.1f} Hz.",
+                flush=True,
+            )
+            if self.wait_for_legs_before_write:
+                print(
+                    f"[Middleware] --wait-for-legs-before-write: will not Write until first frame on {self._legs_topic!r}.",
+                    flush=True,
+                )
         if self.print_merged:
             print(
                 f"[Middleware] --print-merged every {self.print_merged_every} iteration(s); "
@@ -239,6 +255,8 @@ class LowCmdMiddleware:
 
         try:
             iteration = 0
+            wrote_once = False
+            last_wait_log_t = 0.0
             while True:
                 if _shutdown_requested:
                     raise KeyboardInterrupt()
@@ -252,12 +270,26 @@ class LowCmdMiddleware:
                         flush=True,
                     )
                     print(format_lowcmd_for_terminal(self.merged_cmd), flush=True)
-                if self.output_pub is not None and not self.no_write:
-                    if iteration == 0:
-                        print("[Middleware] First merged frame ready; calling DDS Write...", flush=True)
+                legs_ready = self.latest_legs_cmd is not None
+                allow_write = (
+                    self.output_pub is not None
+                    and not self.no_write
+                    and (not self.wait_for_legs_before_write or legs_ready)
+                )
+                if self.wait_for_legs_before_write and not legs_ready and self.output_pub is not None:
+                    if start - last_wait_log_t >= 1.0:
+                        last_wait_log_t = start
+                        print(
+                            f"[Middleware] Waiting for WBC on {self._legs_topic!r} before first DDS Write...",
+                            flush=True,
+                        )
+                if allow_write:
+                    if not wrote_once:
+                        print("[Middleware] First DDS Write (merged LowCmd)...", flush=True)
                     self.output_pub.Write(self.merged_cmd)
-                    if iteration == 0:
+                    if not wrote_once:
                         print("[Middleware] DDS Write returned.", flush=True)
+                        wrote_once = True
                 iteration += 1
                 elapsed = time.time() - start
                 _sleep_interruptible(max(0.0, dt - elapsed))
@@ -269,7 +301,16 @@ class LowCmdMiddleware:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Merge WBC and XR lowcmd streams into rt/lowcmd.")
+    parser = argparse.ArgumentParser(
+        description="Merge WBC and XR lowcmd streams into rt/lowcmd.",
+        epilog=(
+            "Real robot (WBC -> middleware -> G1): omit --no-publish/--no-write; use e.g.\n"
+            "  python lowcmd_middleware.py --network-interface enp12s0 --domain-id 0 "
+            "--publish-rate 50 --publish-to-robot --wait-for-legs-before-write\n"
+            "Unitree topic name is rt/lowcmd (no underscore)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--network-interface", type=str, default=None, help="DDS network interface, e.g. eno1.")
     parser.add_argument("--domain-id", type=int, default=0, help="DDS domain id.")
     parser.add_argument("--publish-rate", type=float, default=50.0, help="Merged lowcmd publish frequency.")
@@ -287,6 +328,16 @@ def parse_args():
         "--no-publish",
         action="store_true",
         help="Do not create a DDS publisher on --output-topic (no rt/lowcmd from this process; safe bench on real robot).",
+    )
+    parser.add_argument(
+        "--publish-to-robot",
+        action="store_true",
+        help="Explicitly enable DDS publish+write to --output-topic (rt/lowcmd). Overrides --no-publish and --no-write.",
+    )
+    parser.add_argument(
+        "--wait-for-legs-before-write",
+        action="store_true",
+        help="Do not call Write() until at least one WBC frame is received on --legs-topic (safer cold start).",
     )
     parser.add_argument(
         "--print-merged",
@@ -323,6 +374,18 @@ if __name__ == "__main__":
     if args.print_merged and args.print_merged_every < 1:
         print("[Middleware] --print-merged-every must be >= 1.", flush=True)
         sys.exit(2)
+
+    no_publish = args.no_publish
+    no_write = args.no_write
+    if args.publish_to_robot:
+        if args.no_publish or args.no_write:
+            print(
+                "[Middleware] --publish-to-robot: overriding --no-publish / --no-write (DDS will write to robot path).",
+                flush=True,
+            )
+        no_publish = False
+        no_write = False
+
     try:
         ChannelFactoryInitialize(args.domain_id, networkInterface=args.network_interface)
         mixer = LowCmdMiddleware(
@@ -332,12 +395,13 @@ if __name__ == "__main__":
             legs_topic=args.legs_topic,
             arms_topic=args.arms_topic,
             output_topic=args.output_topic,
-            no_write=args.no_write,
+            no_write=no_write,
             dds_read_timeout_s=args.dds_read_timeout,
-            no_publish=args.no_publish,
+            no_publish=no_publish,
             print_merged=args.print_merged,
             print_merged_every=args.print_merged_every,
             print_input_rx=args.print_input_rx,
+            wait_for_legs_before_write=args.wait_for_legs_before_write,
         )
         mixer.run()
     except KeyboardInterrupt:
