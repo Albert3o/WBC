@@ -1,7 +1,8 @@
 1.run middleware interface:
 
 ```bash
-python Teleop_Simulator/lowcmd_middleware.py --network-interface eno1 --domain-id 0 --publish-rate 50
+cd /home/deepak/Isaac-GR00T/external_dependencies/GR00T-WholeBodyControl
+python lowcmd_middleware.py --network-interface eno1 --domain-id 0 --publish-rate 50
 ```
 
 2.run WBC:
