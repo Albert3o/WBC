@@ -28,3 +28,12 @@ python lowcmd_middleware.py \
   --print-merged \
   --print-merged-every 25
 ```
+
+```bash
+python lowcmd_middleware.py \
+  --network-interface enp12s0 \
+  --domain-id 0 \
+  --publish-rate 50 \
+  --publish-to-robot \
+  --wait-for-legs-before-write
+```
