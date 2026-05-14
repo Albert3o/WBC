@@ -8,7 +8,7 @@ python lowcmd_middleware.py --network-interface eno1 --domain-id 0 --publish-rat
 2.run WBC:
 
 ```bash
-python Teleop_Simulator/GR00T-WholeBodyControl/gr00t_wbc/control/main/teleop/run_g1_control_loop.py --interface eno1 --no-with_hands
+python gr00t_wbc/control/main/teleop/run_g1_control_loop.py --interface eno1 --no-with_hands
 ```
 
 3.run xr_teleoperation:
